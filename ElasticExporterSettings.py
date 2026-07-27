@@ -54,7 +54,6 @@ def LoadSettings(env_file='.env'):
 
   settings = {'es': Elasticsearch([url], **options)}
   settings['index_name'] = os.getenv('ELASTICSEARCH_INDEX')
-  settings['query_file'] = os.getenv('QUERY_FILE')
   settings['backup_folder'] = os.getenv('BACKUP_FOLDER', 'exported')
   settings['output_name'] = os.getenv('OUTPUT_NAME')
   settings['output_format'] = os.getenv('OUTPUT_FORMAT', 'json').lower()

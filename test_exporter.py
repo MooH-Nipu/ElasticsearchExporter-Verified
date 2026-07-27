@@ -145,7 +145,6 @@ class SettingsTests(unittest.TestCase):
                     "ELASTICSEARCH_USERNAME=elastic\n"
                     "ELASTICSEARCH_PASSWORD='secret value'\n"
                     "ELASTICSEARCH_INDEX=logs-test\n"
-                    "QUERY_FILE=filter.json\n"
                     "BACKUP_FOLDER=exports\n"
                 )
 
@@ -163,7 +162,6 @@ class SettingsTests(unittest.TestCase):
                 http_compress=True,
             )
             self.assertEqual("logs-test", settings["index_name"])
-            self.assertEqual("filter.json", settings["query_file"])
             self.assertEqual("exports", settings["backup_folder"])
 
     def test_loads_csv_output_format(self):

@@ -2,7 +2,7 @@
 Download an elasticsearch index to ndjson using a PIT search
 
 Usage:
-  ElasticExporterCLI.py [--index=<indexname>] [--multiple-indexes] [--backup-folder=<backup_folder>] [--query-file=<query_file>] [--export-csv]
+  ElasticExporterCLI.py [--index=<indexname>] [--multiple-indexes] [--backup-folder=<backup_folder>] [--export-csv]
 
 Options:
   --index=<indexname>  Set the index to export
@@ -10,8 +10,6 @@ Options:
                        e.g. --index=logstash*
   --backup-folder=<backup_folder>
                        Sets the folder to save the export to
-  --query-file=<query_file>
-                       Sets a query filter to limit what is exported 
   --export-csv         Also convert the json file to csv.
 """
 
@@ -172,15 +170,7 @@ def main():
   #set default setting until this feature is added
   settings['NoGroup'] = False
 
-  query_file = options.get('--query-file') or settings.get('query_file')
-  if query_file:
-    with open (query_file, 'rb') as f:
-      settings['query_filter'] = json.load(f)
-    if settings.get('debug'):
-      print ("Loaded Filter : %s" % settings['query_filter'])
-  else:
-    #Default filter match_all
-    settings['query_filter'] = { "bool": { "filter": [ { "match_all": {} } ], } }
+  settings['query_filter'] = { "bool": { "filter": [ { "match_all": {} } ], } }
 
   if os.getenv('PROMPT_TIME_RANGE', 'true').lower() == 'true':
     settings['query_filter'] = prompt_time_range(settings['query_filter'], settings['timestamp'], settings['local_utc_offset'])

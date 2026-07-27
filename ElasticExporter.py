@@ -436,22 +436,18 @@ def convertCSV_WriteCSVFile(FileJSON, FileCSV, EventKeys):
 
     #read the JSON file again and write csv file
     with open(FileJSON, 'r') as f:
-      for line in f.readlines():
+      for line in f:
         lineJSON = convertCSV_FlattenItem ( json.loads(line) )
         dict_writer.writerow(lineJSON)
 
-#reads JSON file and finds all field names 
+#reads JSON file and finds all field names
 #used for the first line of the csv file
 def convertCSV_ReadJSONFile(FileName):
-  EventKeys = []
+  EventKeys = set()
   with open(FileName, 'r') as f:
-    for line in f.readlines():
-      lineJSON = convertCSV_FlattenItem ( json.loads(line) )
-      for i in lineJSON.keys():
-        if i not in EventKeys:
-          EventKeys.append(i)
-  EventKeys.sort()
-  return EventKeys
+    for line in f:
+      EventKeys.update(convertCSV_FlattenItem(json.loads(line)))
+  return sorted(EventKeys)
 
 def convertCSV(FileJSON, remove_source = False):
   FileCSV = os.path.splitext(FileJSON)[0] + '.csv'
