@@ -141,7 +141,7 @@ def prompt_time_range(query, timestamp, utc_offset=7):
     return query
   if not start or not end:
     raise ValueError('Both start and end date/time are required')
-  return add_time_range(query, start, end, timestamp)
+  return add_time_range(query, start, end, timestamp, utc_offset)
 
 
 def field_filter_enabled():

@@ -70,6 +70,18 @@ class QueryConfigTests(unittest.TestCase):
         self.assertEqual("2026-06-30T17:00:00Z", filters[1]["range"]["@timestamp"]["gte"])
         self.assertEqual("old-start", query["bool"]["filter"][0]["range"]["@timestamp"]["gte"])
 
+    def test_prompt_time_range_uses_configured_local_offset(self):
+        with patch("builtins.input", side_effect=["2026-07-01 12:00:00", "2026-07-01 13:00:00"]):
+            result = ElasticExporterCLI.prompt_time_range(
+                {"bool": {"filter": []}},
+                "@timestamp",
+                utc_offset=5,
+            )
+
+        time_range = result["bool"]["filter"][0]["range"]["@timestamp"]
+        self.assertEqual("2026-07-01T07:00:00Z", time_range["gte"])
+        self.assertEqual("2026-07-01T08:00:00Z", time_range["lte"])
+
     def test_searchable_fields_uses_field_caps(self):
         es = Mock()
         es.field_caps.return_value = {"fields": {
@@ -254,6 +266,21 @@ class ProcessIndexTests(unittest.TestCase):
             with open(result, newline="", encoding="utf-8") as exported:
                 row = next(__import__("csv").DictReader(exported))
             self.assertEqual("hello", row["message"])
+
+    def test_csv_conversion_includes_fields_from_later_rows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = os.path.join(folder, "Other.ndjson")
+            with open(source, "w", encoding="utf-8") as output:
+                output.write('{"_source":{"message":"first"}}\n')
+                output.write('{"_source":{"message":"second","agent":{"name":"agent-01"}}}\n')
+
+            result = ElasticExporter.convertCSV(source)
+
+            with open(result, newline="", encoding="utf-8") as exported:
+                rows = list(__import__("csv").DictReader(exported))
+            self.assertEqual(["agent.name", "message"], list(rows[0]))
+            self.assertEqual("", rows[0]["agent.name"])
+            self.assertEqual("agent-01", rows[1]["agent.name"])
 
     def test_make_folders_creates_missing_backup_parent(self):
         with tempfile.TemporaryDirectory() as folder:

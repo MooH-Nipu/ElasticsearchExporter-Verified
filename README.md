@@ -11,7 +11,7 @@ Interactive Python CLI for exporting Elasticsearch indexes to NDJSON or CSV. It 
 - One-line progress bar with percentage, count, and ETA
 - NDJSON or flattened CSV output
 - Exported timestamp conversion to a configured UTC offset
-- Per-file SHA-1 checksum metadata and final count verification
+- Per-file SHA-1 checksum metadata for NDJSON and final count verification
 - Standalone streaming filter for existing CSV and NDJSON exports
 
 ## Requirements
@@ -162,7 +162,7 @@ exported/
         └── all.checksums
 ```
 
-`OUTPUT_FORMAT=csv` creates `incident-july.csv` and removes the temporary NDJSON after successful conversion. Nested objects become dotted CSV columns. Lists are stored as JSON text.
+`OUTPUT_FORMAT=csv` creates `incident-july.csv` and removes the temporary NDJSON after successful conversion. Nested objects become dotted CSV columns. Lists are stored as JSON text. Current checksum metadata describes the temporary NDJSON, not the resulting CSV.
 
 Existing `all.checksums` marks a completed run and causes that output directory to be skipped. Use a different `OUTPUT_NAME` for a distinct query or remove the old output directory deliberately before rerunning it.
 
