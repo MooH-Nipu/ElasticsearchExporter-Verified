@@ -6,6 +6,7 @@ Interactive Python CLI for exporting Elasticsearch indexes to NDJSON or CSV. It 
 
 - Elasticsearch index discovery with grouped wildcard choices such as `hids-*`
 - Interactive WIB (`UTC+7`) time range converted to UTC for Elasticsearch
+- Command-line date, output-name, document-filter, and source-field selection
 - Optional Elasticsearch-side exact field filtering through `_field_caps`
 - PIT + `search_after` pagination with configurable page size, timeout, and delay
 - One-line progress bar with percentage, count, and ETA
@@ -131,7 +132,10 @@ Only `y` or `yes` starts export. Blank input or any other answer cancels before 
 ```powershell
 python .\ElasticExporterCLI.py `
   --index="another-index" `
-  --backup-folder="another-export"
+  --backup-folder="another-export" `
+  --start="2026-07-01 00:00:00" `
+  --end="2026-07-01 23:59:59" `
+  --output-name="incident-july"
 ```
 
 Available options:
@@ -141,7 +145,57 @@ Available options:
 --multiple-indexes             Resolve a wildcard and export each concrete index
 --backup-folder=<folder>       Override BACKUP_FOLDER
 --export-csv                   Force CSV conversion
+--start=<datetime>             Start local date/time; requires --end
+--end=<datetime>               End local date/time; requires --start
+--output-name=<name>           Override OUTPUT_NAME
+--filter=<field=value>         Filter documents; repeatable
+--exclude-filter=<field=value> Exclude matching documents; repeatable
+--filter-logic=<and|or>        Combine repeated filters (default: and)
+--fields=<all|field1,field2>   Select source fields to write
 ```
+
+For a fully non-interactive query, combine the date, output, document filter, and field selection options:
+
+```powershell
+python .\ElasticExporterCLI.py `
+  --index="logs-*" `
+  --start="2026-07-01 00:00:00" `
+  --end="2026-07-01 23:59:59" `
+  --output-name="incident-july" `
+  --filter="agent.name=HOST-*" `
+  --filter="event.kind=alert" `
+  --filter-logic=and `
+  --fields="@timestamp,agent.name,event.kind,message" `
+  --export-csv
+```
+
+`--start` and `--end` use the configured local UTC offset. If neither is supplied, the existing date prompt is controlled by `PROMPT_TIME_RANGE`. `--output-name` takes precedence over `OUTPUT_NAME`; if both are empty, the existing output-name prompt is used.
+
+`--filter` selects documents. Repeat it for multiple field/value pairs and use `--filter-logic=or` when any pair may match. `--exclude-filter` removes documents matching any supplied exclusion clause. Values containing `*` or `?` use an Elasticsearch wildcard query; other values use an exact keyword term when available and otherwise `match_phrase`. When command filters are supplied, the interactive `PROMPT_FIELD_FILTER` prompt is skipped.
+
+`--fields` selects data written after filtering. `--fields=all` writes the complete `_source` object without Elasticsearch hit metadata. A comma-separated list writes only those nested source paths, keeping nested JSON in NDJSON and dotted column names in CSV. Missing fields are blank in CSV and omitted from that NDJSON object. Without `--fields`, the legacy full hit format is retained.
+
+### Contoh: ekspor Kaspersky
+
+Contoh berikut mengekspor data tanggal **19 Agustus 2026 pukul 00:00 sampai 18:00 WIB** dari index `kaspersky*` ke CSV dengan field yang dipilih:
+
+```powershell
+python .\ElasticExporterCLI.py `
+  --index="kaspersky*" `
+  --start="2026-08-19 00:00:00" `
+  --end="2026-08-19 18:00:00" `
+  --output-name="kaspersky-2026-08-19-00-18" `
+  --fields="@timestamp,host,kaspersky.meta_data.hdn,kaspersky.meta_data.gn,kaspersky.details.Component,kaspersky.meta_data.etdn,kaspersky.meta_data.kscfqdn,kaspersky.meta_data.tdn" `
+  --export-csv
+```
+
+Field waktu pada data Kaspersky menggunakan `@timestamp`, bukan `Time`. Karena rentang waktu ditulis tanpa offset, aplikasi memperlakukannya sebagai WIB (`UTC+7`). Setelah query selesai, periksa jumlah dokumen lalu jawab `y` pada prompt `Continue export? [y/N]:` untuk memulai ekspor. File CSV tersimpan di:
+
+```text
+exported/kaspersky-all/kaspersky-2026-08-19-00-18/kaspersky-2026-08-19-00-18.csv
+```
+
+Jika index yang tersedia bernama persis `kaspersky`, ganti `--index="kaspersky*"` menjadi `--index="kaspersky"`.
 
 Multiple concrete indexes:
 
@@ -168,7 +222,7 @@ Existing `all.checksums` marks a completed run and causes that output directory 
 
 `BACKUP_FOLDER` is local file storage, not an Elasticsearch snapshot repository.
 
-## Optional Elasticsearch-side field filter
+## Optional interactive Elasticsearch-side field filter
 
 Set:
 
@@ -176,7 +230,7 @@ Set:
 PROMPT_FIELD_FILTER=true
 ```
 
-The CLI discovers searchable fields with `_field_caps`, lets you search and select one, then adds:
+When no command-line `--filter` is supplied, the CLI can discover searchable fields with `_field_caps`, let you search and select one, then add:
 
 - `term` for a `.keyword` field
 - `match_phrase` when no keyword field exists
@@ -184,6 +238,28 @@ The CLI discovers searchable fields with `_field_caps`, lets you search and sele
 It also checks each returned `_source` against the selected exact value before writing. Field prompting stays disabled by default because `_field_caps` behavior varies across Elasticsearch client/server versions.
 
 For the more compatible option, export first and use `FilterExport.py`.
+
+### Troubleshooting `_field_caps` pada Elasticsearch 7.17
+
+Jika muncul:
+
+```text
+BadRequestError(400, 'illegal_argument_exception', "specified fields can't be null or empty")
+```
+
+CLI akan mencoba ulang `_field_caps` menggunakan format GET query-string (`?fields=*`) yang kompatibel dengan server Elasticsearch lama. Pada koneksi normal hanya satu request yang dilakukan; fallback hanya menambah satu request saat format pertama ditolak. Fallback tidak dijalankan untuk error permission, index, atau koneksi.
+
+Client `elasticsearch` versi 9.x sebaiknya dipasangkan dengan server Elasticsearch versi yang kompatibel. Fallback ini mempertahankan client yang terpasang dan membantu deployment dengan server 7.17 tanpa mengubah alur ekspor.
+
+### Troubleshooting Unicode/encoding pada Windows
+
+Semua file NDJSON, CSV, dan checksum yang dibuat exporter sekarang ditulis dan dibaca sebagai UTF-8 tanpa BOM. Jika muncul error seperti:
+
+```text
+UnicodeEncodeError: 'charmap' codec can't encode character
+```
+
+versi exporter yang dijalankan kemungkinan masih membuka file dengan encoding default Windows (`cp1252`). Tidak perlu menambahkan opsi CLI atau mengubah konfigurasi `.env`; gunakan versi terbaru lalu jalankan command export yang sama. Output yang gagal atau rusak dari versi lama sebaiknya dihapus atau gunakan `OUTPUT_NAME` baru, kemudian ekspor ulang. File lama yang sudah tersimpan dalam `cp1252` tidak dikonversi otomatis.
 
 ## Filter an existing export
 
