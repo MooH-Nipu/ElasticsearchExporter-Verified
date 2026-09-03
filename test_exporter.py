@@ -5,12 +5,254 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+from elasticsearch import BadRequestError
+
 import ElasticExporter
 import ElasticExporterCLI
 import ElasticExporterSettings
 
 
 class QueryConfigTests(unittest.TestCase):
+    def test_parse_filter_specs_preserves_equals_in_value(self):
+        self.assertEqual(
+            [("agent.name", "HOST-*"), ("message", "a=b")],
+            ElasticExporterCLI.parse_filter_specs(
+                ["agent.name=HOST-*", "message=a=b"]
+            ),
+        )
+
+    def test_parse_filter_specs_rejects_missing_field_or_value(self):
+        with self.assertRaisesRegex(ValueError, "field=value"):
+            ElasticExporterCLI.parse_filter_specs(["agent.name"])
+        with self.assertRaisesRegex(ValueError, "cannot be empty"):
+            ElasticExporterCLI.parse_filter_specs(["=wanted"])
+        with self.assertRaisesRegex(ValueError, "cannot be empty"):
+            ElasticExporterCLI.parse_filter_specs(["agent.name="])
+
+    def test_add_field_filters_builds_and_query_without_match_all(self):
+        query = {
+            "bool": {
+                "filter": [
+                    {"match_all": {}},
+                    {"range": {"@timestamp": {"gte": "start", "lte": "end"}}},
+                ]
+            }
+        }
+
+        result = ElasticExporterCLI.add_field_filters(
+            query,
+            [("agent.name", "HOST-*")],
+            logic="and",
+            fields=["agent.name", "agent.name.keyword"],
+        )
+
+        self.assertEqual(
+            [
+                {"range": {"@timestamp": {"gte": "start", "lte": "end"}}},
+                {"wildcard": {"agent.name.keyword": "HOST-*"}},
+            ],
+            result["bool"]["filter"],
+        )
+        self.assertEqual({"match_all": {}}, query["bool"]["filter"][0])
+
+    def test_add_field_filters_builds_or_group(self):
+        result = ElasticExporterCLI.add_field_filters(
+            {"match_all": {}},
+            [("agent.name", "HOST-01"), ("event.kind", "alert")],
+            logic="or",
+            fields=["agent.name", "agent.name.keyword", "event.kind"],
+        )
+
+        self.assertEqual(
+            {
+                "bool": {
+                    "filter": [
+                        {
+                            "bool": {
+                                "should": [
+                                    {"term": {"agent.name.keyword": "HOST-01"}},
+                                    {"match_phrase": {"event.kind": "alert"}},
+                                ],
+                                "minimum_should_match": 1,
+                            }
+                        }
+                    ]
+                }
+            },
+            result,
+        )
+
+    def test_add_field_filters_rejects_invalid_logic(self):
+        with self.assertRaisesRegex(ValueError, "and or"):
+            ElasticExporterCLI.add_field_filters(
+                {"match_all": {}}, [("event.kind", "alert")], logic="xor"
+            )
+
+    def test_add_exclude_filters_builds_must_not_clause(self):
+        query = {
+            "bool": {
+                "filter": [{"match_all": {}}],
+                "must_not": [],
+            }
+        }
+
+        result = ElasticExporterCLI.add_exclude_filters(
+            query,
+            [("decoder.name", "windows_eventchannel")],
+            fields=["decoder.name", "decoder.name.keyword"],
+        )
+
+        self.assertEqual(
+            [{"term": {"decoder.name.keyword": "windows_eventchannel"}}],
+            result["bool"]["must_not"],
+        )
+        self.assertEqual([], result["bool"]["filter"])
+        self.assertEqual({"match_all": {}}, query["bool"]["filter"][0])
+
+    def test_parse_export_fields_supports_all_and_ordered_paths(self):
+        self.assertEqual("all", ElasticExporterCLI.parse_export_fields("all"))
+        self.assertEqual(
+            ["@timestamp", "agent.name", "message"],
+            ElasticExporterCLI.parse_export_fields(
+                "@timestamp, agent.name, message"
+            ),
+        )
+
+    def test_parse_export_fields_rejects_empty_items_and_mixed_all(self):
+        with self.assertRaisesRegex(ValueError, "field list"):
+            ElasticExporterCLI.parse_export_fields("")
+        with self.assertRaisesRegex(ValueError, "all"):
+            ElasticExporterCLI.parse_export_fields("all,message")
+
+    def test_cli_time_options_require_both_dates(self):
+        settings = {
+            "query_filter": {"bool": {"filter": []}},
+            "timestamp": "@timestamp",
+            "local_utc_offset": 7,
+        }
+        with self.assertRaisesRegex(ValueError, "Both start and end"):
+            ElasticExporterCLI.apply_cli_query_options(
+                settings, {"--start": "2026-07-01 00:00:00", "--end": None}
+            )
+
+    def test_cli_time_options_skip_prompt_when_dates_are_given(self):
+        settings = {
+            "query_filter": {"bool": {"filter": []}},
+            "timestamp": "@timestamp",
+            "local_utc_offset": 7,
+        }
+        options = {"--start": "2026-07-01 00:00:00", "--end": "2026-07-01 01:00:00"}
+
+        with patch.object(ElasticExporterCLI, "prompt_time_range") as prompt:
+            ElasticExporterCLI.apply_cli_query_options(settings, options)
+
+        prompt.assert_not_called()
+        self.assertEqual(
+            "2026-06-30T17:00:00Z",
+            settings["query_filter"]["bool"]["filter"][0]["range"]["@timestamp"]["gte"],
+        )
+
+    def test_cli_output_name_overrides_existing_setting(self):
+        settings = {"output_name": "from-env"}
+        ElasticExporterCLI.apply_cli_output_options(
+            settings, {"--output-name": "from-cli", "--fields": "agent.name,message"}
+        )
+        self.assertEqual("from-cli", settings["output_name"])
+        self.assertEqual(["agent.name", "message"], settings["export_fields"])
+
+    def test_docopt_accepts_all_non_interactive_cli_options(self):
+        options = ElasticExporterCLI.docopt(
+            ElasticExporterCLI.__doc__,
+            argv=[
+                "--start=2026-07-01 00:00:00",
+                "--end=2026-07-01 23:59:59",
+                "--output-name=incident",
+                "--filter=agent.name=HOST-*",
+                "--filter=event.kind=alert",
+                "--filter-logic=or",
+                "--exclude-filter=decoder.name=windows_eventchannel",
+                "--fields=@timestamp,agent.name",
+            ],
+        )
+        self.assertEqual(
+            ["agent.name=HOST-*", "event.kind=alert"],
+            options["--filter"],
+        )
+        self.assertEqual("or", options["--filter-logic"])
+        self.assertEqual(
+            ["decoder.name=windows_eventchannel"],
+            options["--exclude-filter"],
+        )
+        self.assertEqual("@timestamp,agent.name", options["--fields"])
+
+    def test_cli_exclude_filter_adds_must_not_clause(self):
+        es = Mock()
+        es.field_caps.return_value = {"fields": {
+            "decoder.name": {"text": {"searchable": True}},
+            "decoder.name.keyword": {"keyword": {"searchable": True}},
+        }}
+        settings = {
+            "es": es,
+            "index_name": "hids-*",
+            "query_filter": {"bool": {"filter": [{"match_all": {}}]}},
+            "timestamp": "@timestamp",
+            "local_utc_offset": 7,
+        }
+        options = {
+            "--filter": [],
+            "--exclude-filter": ["decoder.name=windows_eventchannel"],
+            "--filter-logic": "and",
+            "--start": None,
+            "--end": None,
+        }
+
+        with patch.dict(os.environ, {"PROMPT_TIME_RANGE": "false"}, clear=True):
+            ElasticExporterCLI.apply_cli_query_options(settings, options)
+
+        self.assertEqual(
+            [{"term": {"decoder.name.keyword": "windows_eventchannel"}}],
+            settings["query_filter"]["bool"]["must_not"],
+        )
+
+    def test_cli_filter_skips_interactive_field_prompt(self):
+        es = Mock()
+        es.field_caps.return_value = {"fields": {
+            "agent.name": {"text": {"searchable": True}},
+            "agent.name.keyword": {"keyword": {"searchable": True}},
+        }}
+        settings = {
+            "es": es,
+            "index_name": "logs-*",
+            "query_filter": {"bool": {"filter": [{"match_all": {}}]}},
+            "timestamp": "@timestamp",
+            "local_utc_offset": 7,
+        }
+        options = {
+            "--filter": ["agent.name=HOST-01"],
+            "--filter-logic": "and",
+            "--start": None,
+            "--end": None,
+        }
+
+        with patch.object(ElasticExporterCLI, "prompt_field_filter") as prompt, \
+             patch.dict(os.environ, {"PROMPT_TIME_RANGE": "false"}, clear=True):
+            ElasticExporterCLI.apply_cli_query_options(settings, options)
+
+        prompt.assert_not_called()
+
+    def test_cli_filter_logic_is_validated_without_filters(self):
+        settings = {
+            "query_filter": {"bool": {"filter": []}},
+            "timestamp": "@timestamp",
+            "local_utc_offset": 7,
+        }
+        with patch.dict(os.environ, {"PROMPT_TIME_RANGE": "false"}, clear=True), \
+             self.assertRaisesRegex(ValueError, "and or or"):
+            ElasticExporterCLI.apply_cli_query_options(
+                settings,
+                {"--filter": [], "--filter-logic": "xor", "--start": None, "--end": None},
+            )
+
     def test_field_filter_prompt_is_disabled_by_default(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertFalse(ElasticExporterCLI.field_filter_enabled())
@@ -95,6 +337,78 @@ class QueryConfigTests(unittest.TestCase):
 
         self.assertEqual(["agent.name", "agent.name.keyword"], fields)
         es.field_caps.assert_called_once_with(index="hids-*", fields=["*"])
+
+    def test_field_caps_falls_back_to_query_parameter_for_old_server(self):
+        es = Mock()
+        es.field_caps.side_effect = BadRequestError(
+            "specified fields can't be null or empty",
+            Mock(),
+            {"error": {"reason": "specified fields can't be null or empty"}},
+        )
+        response = {"fields": {
+            "agent.name": {"text": {"searchable": True}},
+            "agent.name.keyword": {"keyword": {"searchable": True}},
+        }}
+        es.perform_request.return_value = response
+
+        capabilities = ElasticExporterCLI.searchable_field_capabilities(es, "hids-*")
+
+        self.assertEqual(response["fields"], capabilities)
+        es.perform_request.assert_called_once_with(
+            "GET",
+            "/hids-*/_field_caps",
+            params={"fields": "*"},
+        )
+
+    def test_field_caps_does_not_fallback_for_unrelated_bad_request(self):
+        es = Mock()
+        error = BadRequestError(
+            "index is unavailable",
+            Mock(),
+            {"error": {"reason": "index is unavailable"}},
+        )
+        es.field_caps.side_effect = error
+
+        with self.assertRaises(BadRequestError):
+            ElasticExporterCLI.searchable_field_capabilities(es, "hids-*")
+
+        es.perform_request.assert_not_called()
+
+    def test_filter_uses_keyword_after_field_caps_fallback_without_warning(self):
+        es = Mock()
+        es.field_caps.side_effect = BadRequestError(
+            "specified fields can't be null or empty",
+            Mock(),
+            {"error": {"reason": "specified fields can't be null or empty"}},
+        )
+        es.perform_request.return_value = {"fields": {
+            "decoder.name": {"text": {"searchable": True}},
+            "decoder.name.keyword": {"keyword": {"searchable": True}},
+        }}
+        settings = {
+            "es": es,
+            "index_name": "hids-*",
+            "query_filter": {"bool": {"filter": [{"match_all": {}}]}},
+            "timestamp": "@timestamp",
+            "local_utc_offset": 7,
+        }
+        options = {
+            "--filter": ["decoder.name=windows_eventchannel"],
+            "--filter-logic": "and",
+            "--start": None,
+            "--end": None,
+        }
+
+        with patch.dict(os.environ, {"PROMPT_TIME_RANGE": "false"}, clear=True), \
+             patch("builtins.print") as output:
+            ElasticExporterCLI.apply_cli_query_options(settings, options)
+
+        self.assertEqual(
+            {"term": {"decoder.name.keyword": "windows_eventchannel"}},
+            settings["query_filter"]["bool"]["filter"][0],
+        )
+        messages = [str(call.args[0]) for call in output.call_args_list if call.args]
+        self.assertFalse(any("Field discovery failed" in message for message in messages))
 
     def test_field_caps_failure_allows_manual_field(self):
         es = Mock()
@@ -243,6 +557,154 @@ class ProcessIndexTests(unittest.TestCase):
 
         self.assertEqual(1, len(results))
         self.assertEqual("wanted", results[0]["_source"]["agent"]["name"])
+
+    def test_write_results_selected_fields_keep_nested_source_without_metadata(self):
+        with tempfile.TemporaryDirectory() as folder:
+            settings = {
+                "fullpath": folder,
+                "export_fields": ["agent.name", "message"],
+                "timestamp": "@timestamp",
+                "export_utc_offset": 7,
+            }
+            results = {
+                "timed_out": False,
+                "_shards": {"failed": 0},
+                "hits": {
+                    "total": 1,
+                    "hits": [{
+                        "_index": "logs-2026.07.01",
+                        "_id": "abc",
+                        "_score": None,
+                        "sort": [1],
+                        "_source": {
+                            "agent": {"name": "HOST-01"},
+                            "message": "keep",
+                            "secret": "drop",
+                        },
+                    }],
+                },
+            }
+
+            result = ElasticExporter.WriteResults(settings, "Other", 1, results)
+
+            self.assertEqual([1], result["sort"])
+            with open(os.path.join(folder, "Other.ndjson"), encoding="utf-8") as exported:
+                item = json.loads(exported.readline())
+            self.assertEqual(
+                {"agent": {"name": "HOST-01"}, "message": "keep"},
+                item,
+            )
+
+    def test_write_results_all_fields_keep_source_without_metadata(self):
+        with tempfile.TemporaryDirectory() as folder:
+            settings = {"fullpath": folder, "export_fields": "all"}
+            results = {
+                "timed_out": False,
+                "_shards": {"failed": 0},
+                "hits": {
+                    "total": 1,
+                    "hits": [{
+                        "_index": "logs-2026.07.01",
+                        "_id": "abc",
+                        "_source": {"message": "keep", "secret": "also-keep"},
+                    }],
+                },
+            }
+
+            ElasticExporter.WriteResults(settings, "Other", 1, results)
+
+            with open(os.path.join(folder, "Other.ndjson"), encoding="utf-8") as exported:
+                self.assertEqual(
+                    {"message": "keep", "secret": "also-keep"},
+                    json.loads(exported.readline()),
+                )
+
+    def test_write_results_without_fields_keeps_legacy_hit_shape(self):
+        with tempfile.TemporaryDirectory() as folder:
+            settings = {"fullpath": folder}
+            hit = {"_index": "logs", "_id": "abc", "_source": {"message": "keep"}}
+            results = {
+                "timed_out": False,
+                "_shards": {"failed": 0},
+                "hits": {"total": 1, "hits": [hit]},
+            }
+
+            ElasticExporter.WriteResults(settings, "Other", 1, results)
+
+            with open(os.path.join(folder, "Other.ndjson"), encoding="utf-8") as exported:
+                self.assertEqual(hit, json.loads(exported.readline()))
+
+    def test_write_results_uses_utf8_for_unicode_source_when_default_is_cp1252(self):
+        with tempfile.TemporaryDirectory() as folder:
+            settings = {"fullpath": folder}
+            results = {
+                "timed_out": False,
+                "_shards": {"failed": 0},
+                "hits": {
+                    "total": 1,
+                    "hits": [{"_source": {"message": "left\u200e-to-right"}}],
+                },
+            }
+
+            def cp1252_default_open(file, mode="r", *args, **kwargs):
+                if "b" not in mode and "encoding" not in kwargs:
+                    kwargs["encoding"] = "cp1252"
+                return io.open(file, mode, *args, **kwargs)
+
+            with patch("builtins.open", side_effect=cp1252_default_open):
+                ElasticExporter.WriteResults(settings, "Other", 1, results)
+
+            with io.open(os.path.join(folder, "Other.ndjson"), encoding="utf-8") as exported:
+                item = json.loads(exported.readline())
+            self.assertEqual("left\u200e-to-right", item["_source"]["message"])
+
+    def test_convert_csv_selected_fields_preserve_order_and_missing_values(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = os.path.join(folder, "Other.ndjson")
+            with open(source, "w", encoding="utf-8") as output:
+                output.write(json.dumps({"agent": {"name": "one"}, "message": "first"}) + "\n")
+                output.write(json.dumps({"agent": {"name": "two"}}) + "\n")
+
+            result = ElasticExporter.convertCSV(
+                source,
+                event_keys=["agent.name", "message"],
+            )
+
+            with open(result, newline="", encoding="utf-8") as exported:
+                reader = __import__("csv").DictReader(exported)
+                rows = list(reader)
+            self.assertEqual(["agent.name", "message"], reader.fieldnames)
+            self.assertEqual("", rows[1]["message"])
+
+    def test_convert_csv_reads_utf8_ndjson_when_default_is_cp1252(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = os.path.join(folder, "Other.ndjson")
+            with io.open(source, "w", encoding="utf-8") as output:
+                output.write(json.dumps({"_source": {"message": "left\u200e-to-right"}}, ensure_ascii=False) + "\n")
+
+            def cp1252_default_open(file, mode="r", *args, **kwargs):
+                if "b" not in mode and "encoding" not in kwargs:
+                    kwargs["encoding"] = "cp1252"
+                return io.open(file, mode, *args, **kwargs)
+
+            with patch("builtins.open", side_effect=cp1252_default_open):
+                result = ElasticExporter.convertCSV(source)
+
+            with io.open(result, newline="", encoding="utf-8") as exported:
+                row = next(__import__("csv").DictReader(exported))
+            self.assertEqual("left\u200e-to-right", row["message"])
+
+    def test_source_search_kwargs_include_selected_fields(self):
+        self.assertEqual(
+            {"source_includes": ["agent.name", "message"]},
+            ElasticExporter.source_search_kwargs({
+                "export_fields": ["agent.name", "message"],
+            }),
+        )
+        self.assertEqual(
+            {},
+            ElasticExporter.source_search_kwargs({"export_fields": "all"}),
+        )
 
     def test_export_timestamp_converts_to_utc_plus_7(self):
         item = {"_source": {"@timestamp": "2026-07-01T07:30:15.123Z", "message": "hello"}}

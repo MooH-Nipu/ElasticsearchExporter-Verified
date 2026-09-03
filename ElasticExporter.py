@@ -8,6 +8,7 @@ import json, csv, os, sys
 import hashlib, gzip, shutil
 import base64
 import traceback
+from copy import deepcopy
 
 
 def GetListGroups(es, index_name, settings):
@@ -46,7 +47,7 @@ def MakeFolders(settings):
 
 
 def CountLines(filename):
-  with open(filename) as f:
+  with open(filename, encoding='utf-8') as f:
     for i, l in enumerate(f):
       pass
   return i + 1
@@ -78,7 +79,7 @@ def FinishFolder(settings, TotalEventCount):
     for FileName in files:
       if FileName.endswith(".checksums"):
         FullFileName = settings['fullpath'] + '/' + FileName
-        with open (FullFileName, 'r') as f:
+        with open (FullFileName, 'r', encoding='utf-8') as f:
           contents = json.loads( f.read() )
           for item in contents.keys():
             AllCount += contents[item]['events']
@@ -87,7 +88,7 @@ def FinishFolder(settings, TotalEventCount):
     if AllCount == TotalEventCount:
       print ("Exported every item in the index")
       print (AllChecksums)
-      with open(FileAllChecksums, 'w') as f:
+      with open(FileAllChecksums, 'w', encoding='utf-8') as f:
         f.write( json.dumps( AllChecksums ))
     elif not settings['NoGroup']:
       print ("Exported filtered search")
@@ -160,7 +161,8 @@ def SearchGroup(es, index_name, settings, field_filter, TotalExported = 0, Exclu
     search_q['pit'] = { 'id' : results['id'] }
 
     SortOrder = { settings['timestamp'] : { "order": "asc", "format": "strict_date_optional_time_nanos" } }
-    results = es.search( query=search_q['query'], pit=search_q['pit'], size=settings['page_size'], sort=SortOrder, request_timeout=settings['request_timeout'], rest_total_hits_as_int=True)
+    source_kwargs = source_search_kwargs(settings)
+    results = es.search( query=search_q['query'], pit=search_q['pit'], size=settings['page_size'], sort=SortOrder, request_timeout=settings['request_timeout'], rest_total_hits_as_int=True, **source_kwargs)
     expected = results['hits']['total']
 
     print ("Total items to export : %s" % ( f'{expected:,}' ) )
@@ -179,7 +181,7 @@ def SearchGroup(es, index_name, settings, field_filter, TotalExported = 0, Exclu
         results = first_page
         first_page = None
       else:
-        results = es.search(query=search_q['query'], pit=search_q['pit'], size=settings['page_size'], sort=SortOrder, request_timeout=settings['request_timeout'], search_after=search_after )
+        results = es.search(query=search_q['query'], pit=search_q['pit'], size=settings['page_size'], sort=SortOrder, request_timeout=settings['request_timeout'], search_after=search_after, **source_kwargs )
 
       CurrentExported += len (results['hits']['hits'] )
       write_progress(progress_line(CurrentExported, expected, monotonic() - started))
@@ -240,18 +242,75 @@ def convert_timestamps(item, timestamp='@timestamp', utc_offset=7):
   return item
 
 
+def source_search_kwargs(settings):
+  fields = settings.get('export_fields')
+  if isinstance(fields, list):
+    return {'source_includes': fields}
+  return {}
+
+
+def _source_value(source, field):
+  if not isinstance(source, dict):
+    return None, False
+  if field in source:
+    return source[field], True
+  current = source
+  for part in field.split('.'):
+    if not isinstance(current, dict) or part not in current:
+      return None, False
+    current = current[part]
+  return current, True
+
+
+def _set_source_value(target, field, value):
+  parts = field.split('.')
+  current = target
+  for part in parts[:-1]:
+    child = current.get(part)
+    if not isinstance(child, dict):
+      child = {}
+      current[part] = child
+    current = child
+  current[parts[-1]] = deepcopy(value)
+
+
+def project_source(source, fields):
+  if fields == 'all':
+    return deepcopy(source) if isinstance(source, dict) else {}
+  projected = {}
+  if not isinstance(source, dict):
+    return projected
+  for field in fields or []:
+    value, found = _source_value(source, field)
+    if found:
+      _set_source_value(projected, field, value)
+  return projected
+
+
+def export_item(item, export_fields, timestamp='@timestamp', utc_offset=7):
+  if export_fields is None:
+    return convert_timestamps(item, timestamp, utc_offset)
+  source = project_source(item.get('_source', {}), export_fields)
+  return convert_timestamps(source, timestamp, utc_offset)
+
+
 def WriteResults(settings, field_filter, expected, results, IgnoreCount = False, ExcludeField = False):
   if not results['timed_out']:
     if results['_shards']['failed'] == 0:
       total = results['hits']['total']
       total = total['value'] if isinstance(total, dict) else total
       if total == expected or IgnoreCount or ExcludeField:
-        ExportFile = open ( settings['fullpath'] + '/' + field_filter + '.ndjson', 'a')
+        ExportFile = open ( settings['fullpath'] + '/' + field_filter + '.ndjson', 'a', encoding='utf-8')
         hits = results['hits']['hits']
         if settings.get('output_filter_field'):
           hits = filter_hits(hits, settings['output_filter_field'], settings['output_filter_value'])
         for item in hits:
-          item = convert_timestamps(item, settings.get('timestamp', '@timestamp'), settings.get('export_utc_offset', 7))
+          item = export_item(
+            item,
+            settings.get('export_fields'),
+            settings.get('timestamp', '@timestamp'),
+            settings.get('export_utc_offset', 7),
+          )
           ExportFile.write(json.dumps(item, ensure_ascii=False, separators=(',', ':')))
           ExportFile.write('\n')
         ExportFile.close()
@@ -297,7 +356,7 @@ def ProcessGroup(es, index_name, settings, group, ExcludeField = False, AllItems
     file_lc = CountLines(source)
     checksums = { group + ".ndjson" : { "sha1" : file_sha1, "size" : filesize, "events" : file_lc }}
     print ("Exported file stats : %s" % checksums)
-    with open (settings['fullpath'] + '/' + group + '.checksums', 'w') as f:
+    with open (settings['fullpath'] + '/' + group + '.checksums', 'w', encoding='utf-8') as f:
       f.write(json.dumps(checksums))
       f.close()
 
@@ -337,7 +396,11 @@ def ExportIndex(es, settings, TimeSeries, ExcludeField = False, AllItems = True,
           os.remove( file_ndjson )
         ProcessGroup(es, settings['index_name'], settings, group )
         if settings['export-csv']:
-          convertCSV(file_ndjson, remove_source=True)
+          convertCSV(
+            file_ndjson,
+            remove_source=True,
+            event_keys=settings.get('export_fields') if isinstance(settings.get('export_fields'), list) else None,
+          )
 
   #again for results with no group
   group = settings['FileNameOther']
@@ -349,7 +412,11 @@ def ExportIndex(es, settings, TimeSeries, ExcludeField = False, AllItems = True,
       os.remove( file_ndjson )
     ProcessGroup(es, settings['index_name'], settings, group, ExcludeField = ExcludeField, AllItems = AllItems )
     if settings['export-csv']:
-      convertCSV(file_ndjson, remove_source=True)
+      convertCSV(
+        file_ndjson,
+        remove_source=True,
+        event_keys=settings.get('export_fields') if isinstance(settings.get('export_fields'), list) else None,
+      )
   
 def CountExported(settings):
   total = 0
@@ -357,7 +424,7 @@ def CountExported(settings):
     return total
   for filename in os.listdir(settings['fullpath']):
     if filename.endswith('.checksums') and filename != 'all.checksums':
-      with open(os.path.join(settings['fullpath'], filename), 'r') as f:
+      with open(os.path.join(settings['fullpath'], filename), 'r', encoding='utf-8') as f:
         total += sum(item['events'] for item in json.load(f).values())
   return total
 
@@ -430,12 +497,12 @@ def convertCSV_FlattenItem(item):
   return NewItem
 
 def convertCSV_WriteCSVFile(FileJSON, FileCSV, EventKeys):
-  with open(FileCSV, 'w', newline='')  as output_file:
-    dict_writer = csv.DictWriter(output_file, fieldnames=EventKeys)
+  with open(FileCSV, 'w', newline='', encoding='utf-8')  as output_file:
+    dict_writer = csv.DictWriter(output_file, fieldnames=EventKeys, restval='', extrasaction='ignore')
     dict_writer.writeheader()
 
     #read the JSON file again and write csv file
-    with open(FileJSON, 'r') as f:
+    with open(FileJSON, 'r', encoding='utf-8') as f:
       for line in f:
         lineJSON = convertCSV_FlattenItem ( json.loads(line) )
         dict_writer.writerow(lineJSON)
@@ -444,15 +511,15 @@ def convertCSV_WriteCSVFile(FileJSON, FileCSV, EventKeys):
 #used for the first line of the csv file
 def convertCSV_ReadJSONFile(FileName):
   EventKeys = set()
-  with open(FileName, 'r') as f:
+  with open(FileName, 'r', encoding='utf-8') as f:
     for line in f:
       EventKeys.update(convertCSV_FlattenItem(json.loads(line)))
   return sorted(EventKeys)
 
-def convertCSV(FileJSON, remove_source = False):
+def convertCSV(FileJSON, remove_source = False, event_keys = None):
   FileCSV = os.path.splitext(FileJSON)[0] + '.csv'
   print ("converting file %s to csv" % FileJSON)
-  EventKeys = convertCSV_ReadJSONFile(FileJSON)
+  EventKeys = event_keys if event_keys is not None else convertCSV_ReadJSONFile(FileJSON)
   convertCSV_WriteCSVFile(FileJSON, FileCSV, EventKeys)
   if remove_source:
     os.remove(FileJSON)
@@ -472,5 +539,3 @@ def ProcessMultipleIndexes(settings):
 
 if __name__ == "__main__":
   print ("This is the ElasticExporter library - please use ElasticExporterCLI.py instead")
-
-
