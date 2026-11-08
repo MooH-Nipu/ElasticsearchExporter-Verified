@@ -68,6 +68,8 @@ def LoadSettings(env_file='.env'):
     raise ValueError('PAGE_SIZE must be between 100 and 10000')
   settings['request_timeout'] = int(os.getenv('REQUEST_TIMEOUT', '120'))
   settings['page_delay'] = float(os.getenv('PAGE_DELAY', '0.05'))
+  settings['resume'] = os.getenv('RESUME', 'true').lower() == 'true'
+  settings['pit_keepalive'] = os.getenv('PIT_KEEPALIVE', '5m')
   settings['FileNameOther'] = 'Other'
   settings['debug'] = os.getenv('DEBUG', 'false').lower() == 'true'
   return settings
