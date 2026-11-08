@@ -518,6 +518,22 @@ class ProcessIndexTests(unittest.TestCase):
             ElasticExporter.progress_line(5000, 10000, elapsed=10, width=10),
         )
 
+    def test_progress_line_eta_follows_recent_rate_and_hides_early_guess(self):
+        # a slow first page is evicted once the window fills, so the ETA recovers
+        samples = [(100.0, 2000), (101.0, 4000), (102.0, 6000)]
+        self.assertEqual(
+            "Progress: [####------] 40.0% | 6,000/15,000 | ETA 00:04 | 2,000/s",
+            ElasticExporter.progress_line(6000, 15000, elapsed=102.0, width=10, samples=samples),
+        )
+        # lifetime average would have said ~2 minutes; the window must not
+        self.assertNotIn("02:3", ElasticExporter.progress_line(
+            6000, 15000, elapsed=102.0, width=10, samples=samples))
+        window = __import__("collections").deque([(0.0, 0), (100.0, 2000)], maxlen=2)
+        window.append((101.0, 4000))
+        self.assertAlmostEqual(2000, ElasticExporter._rate(window, 4000, 101.0))
+        # too few samples: refuse to show a made-up ETA
+        self.assertIn("ETA --:--", ElasticExporter.progress_line(1000, 9000, elapsed=50, samples=[(0.0, 0)]))
+
     def test_progress_redraw_uses_one_terminal_line(self):
         output = io.StringIO()
         ElasticExporter.write_progress("first long status", stream=output)
@@ -778,6 +794,131 @@ class ProcessIndexTests(unittest.TestCase):
             messages = [str(call.args[0]) for call in output.call_args_list if call.args]
             self.assertIn("Query matched 2 documents", messages)
             self.assertIn("VERIFIED: exported 2 of 2 matched documents", messages)
+
+
+class ResumeTests(unittest.TestCase):
+    def _docs(self, count=10):
+        return [
+            {
+                "_index": "waf",
+                "_id": "d%s" % i,
+                "_source": {"n": i},
+                "sort": ["2026-11-07T00:00:%02d.000Z" % i, i],
+            }
+            for i in range(count)
+        ]
+
+    def _settings(self, folder):
+        return {
+            "fullpath": folder,
+            "page_size": 3,
+            "request_timeout": 30,
+            "page_delay": 0,
+            "TimeSeries": True,
+            "timestamp": "@timestamp",
+            "resume": True,
+            "pit_keepalive": "5m",
+            "export_fields": "all",
+            "export_utc_offset": 7,
+            "query_filter": {"bool": {"filter": [{"match_all": {}}]}},
+            "debug": False,
+        }
+
+    def _fake_es(self, docs, fail_on_fetch=None):
+        es = Mock()
+        es.open_point_in_time.return_value = {"id": "pit-1"}
+        es.close_point_in_time.return_value = {"succeeded": True}
+        calls = {"fetch": 0}
+
+        def search(**kwargs):
+            first = "rest_total_hits_as_int" in kwargs
+            if not first:
+                calls["fetch"] += 1
+                if fail_on_fetch and calls["fetch"] == fail_on_fetch:
+                    raise RuntimeError("connection reset mid export")
+            gte = None
+            skip_ids = set()
+            for clause in kwargs["query"]["bool"].get("filter", []):
+                if "range" in clause:
+                    gte = clause["range"]["@timestamp"]["gte"]
+                if "bool" in clause:
+                    for skipped in clause["bool"].get("must_not", []):
+                        skip_ids = set(skipped["ids"]["values"])
+            # the resume range + ids filter shrink the match set, exactly like a real cluster
+            window = [d for d in docs if gte is None or d["sort"][0] >= gte]
+            window = [d for d in window if d["_id"] not in skip_ids]
+            after = kwargs.get("search_after")
+            if after:
+                window = [d for d in window if d["sort"] > after]
+            page = window[: kwargs["size"]]
+            return {
+                "timed_out": False,
+                "_shards": {"failed": 0},
+                "hits": {"total": len(window), "hits": page},
+            }
+
+        es.search.side_effect = search
+        return es
+
+    def _lines(self, folder):
+        with open(os.path.join(folder, "Other.ndjson"), encoding="utf-8") as f:
+            return [json.loads(line) for line in f]
+
+    def test_failed_export_keeps_partial_file_and_resume_continues_without_duplicates(self):
+        docs = self._docs(10)
+        with tempfile.TemporaryDirectory() as folder:
+            settings = self._settings(folder)
+            failing = self._fake_es(docs, fail_on_fetch=2)
+            # the mock cannot raise from inside SearchGroup's own try/except, so exercise
+            # the same path: page 2 dies, SearchGroup returns failed and keeps the file
+            with self.assertRaises(RuntimeError):
+                ElasticExporter.SearchGroup(failing, "waf", settings, "Other", AllItems=True)
+            self.assertEqual(6, len(self._lines(folder)))       # partial run is preserved
+            self.assertTrue(os.path.exists(os.path.join(folder, "Other.ndjson.checkpoint")))
+
+            second = ElasticExporter.SearchGroup(
+                self._fake_es(docs), "waf", settings, "Other", AllItems=True
+            )
+            self.assertFalse(second["failed"])
+            exported = self._lines(folder)
+            self.assertEqual([d["_source"] for d in docs], exported)   # every doc exactly once
+            self.assertFalse(os.path.exists(os.path.join(folder, "Other.ndjson.checkpoint")))
+
+    def test_duplicate_timestamp_at_page_boundary_is_not_lost_or_repeated(self):
+        docs = self._docs(4)
+        docs[2]["sort"] = docs[1]["sort"]        # same timestamp, different _id
+        docs[2]["_id"] = "d1b"
+        with tempfile.TemporaryDirectory() as folder:
+            settings = self._settings(folder)
+            ElasticExporter.SearchGroup(self._fake_es(docs), "waf", settings, "Other", AllItems=True)
+            exported = self._lines(folder)
+            self.assertEqual(sorted(d["_source"]["n"] for d in docs), sorted(e["n"] for e in exported))
+
+    def test_resume_disabled_starts_over(self):
+        docs = self._docs(4)
+        with tempfile.TemporaryDirectory() as folder:
+            settings = self._settings(folder)
+            with open(os.path.join(folder, "Other.ndjson"), "w", encoding="utf-8") as f:
+                f.write('{"stale":true}\n')
+            with open(os.path.join(folder, "Other.ndjson.checkpoint"), "w", encoding="utf-8") as f:
+                json.dump({"lines": 1, "ts": "2026-11-07T00:00:00.000Z", "ids": []}, f)
+            settings["resume"] = False
+            ElasticExporter.SearchGroup(self._fake_es(docs), "waf", settings, "Other", AllItems=True)
+            self.assertEqual(4, len(self._lines(folder)))
+            self.assertNotIn({"stale": True}, self._lines(folder))
+
+    def test_process_group_keeps_partial_file_on_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            settings = self._settings(folder)
+            source = os.path.join(folder, "Other.ndjson")
+            with open(source, "w", encoding="utf-8") as f:
+                f.write('{"kept":true}\n')
+            with patch.object(
+                ElasticExporter, "SearchGroup",
+                return_value={"failed": True, "message": "search timed out"},
+            ):
+                ElasticExporter.ProcessGroup(Mock(), "waf", settings, "Other", AllItems=True)
+            self.assertTrue(os.path.exists(source))
 
 
 if __name__ == "__main__":

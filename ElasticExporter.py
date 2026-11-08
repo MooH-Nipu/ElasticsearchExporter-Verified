@@ -2,11 +2,11 @@
 
 from datetime import datetime, timedelta, timezone
 from time import monotonic, sleep, strftime
+from collections import deque
 from elasticsearch import Elasticsearch
 from datetime import datetime
 import json, csv, os, sys
-import hashlib, gzip, shutil
-import base64
+import hashlib
 import traceback
 from copy import deepcopy
 
@@ -51,6 +51,46 @@ def CountLines(filename):
     for i, l in enumerate(f):
       pass
   return i + 1
+
+
+def LoadCheckpoint(path):
+  if not os.path.exists(path):
+    return None
+  try:
+    with open(path, encoding='utf-8') as f:
+      state = json.load(f)
+  except (OSError, ValueError):
+    print("Unreadable checkpoint %s, starting that group over" % path)
+    return None
+  if not isinstance(state, dict) or 'lines' not in state or not state.get('ts'):
+    return None
+  return state
+
+
+def SaveCheckpoint(path, lines, ts, ids):
+  tmp = path + '.tmp'
+  with open(tmp, 'w', encoding='utf-8') as f:
+    json.dump({'lines': lines, 'ts': ts, 'ids': list(ids)}, f)
+    f.flush()
+    os.fsync(f.fileno())
+  os.replace(tmp, path)
+
+
+def TruncateLines(filename, keep):
+  """Drop a partially written trailing page. Returns the number of lines kept."""
+  with open(filename, 'r+b') as f:
+    if keep <= 0:
+      f.truncate(0)
+      return 0
+    offset = 0
+    seen = 0
+    for line in f:
+      offset += len(line)
+      seen += 1
+      if seen >= keep:
+        break
+    f.truncate(offset)
+    return seen
 
 
 def CalcChecksum(filename):
@@ -102,15 +142,29 @@ def FinishFolder(settings, TotalEventCount):
     print ("found all.checksums, nothing to do")
 
 
-def progress_line(done, total, elapsed=0, width=30):
+def _rate(samples, done, elapsed):
+  """docs/second over the sample window, so slow pages stop poisoning the ETA."""
+  if samples and len(samples) >= 2:
+    (t0, n0), (t1, n1) = samples[0], samples[-1]
+    return (n1 - n0) / (t1 - t0) if t1 > t0 else 0
+  return done / elapsed if done and elapsed else 0
+
+
+def progress_line(done, total, elapsed=0.0, width=30, samples=None):
   ratio = min(done / total, 1) if total else 1
   filled = int(width * ratio)
-  eta = 0 if not done or ratio >= 1 else elapsed * (total - done) / done
+  rate = _rate(samples, done, elapsed)
+  eta = 0 if not rate or ratio >= 1 else (total - done) / rate
   minutes, seconds = divmod(max(0, int(eta)), 60)
   hours, minutes = divmod(minutes, 60)
   eta_text = '%02d:%02d:%02d' % (hours, minutes, seconds) if hours else '%02d:%02d' % (minutes, seconds)
-  return "Progress: [%s%s] %.1f%% | %s/%s | ETA %s" % (
-    '#' * filled, '-' * (width - filled), ratio * 100, f'{done:,}', f'{total:,}', eta_text)
+  if samples is not None and len(samples) < 3:   # not enough data yet, do not guess
+    eta_text = '--:--'
+  suffix = ''
+  if samples is not None and len(samples) >= 3 and rate:
+    suffix = ' | %s/s' % (f'{rate:,.0f}' if rate >= 10 else f'{rate:.1f}')
+  return "Progress: [%s%s] %.1f%% | %s/%s | ETA %s%s" % (
+    '#' * filled, '-' * (width - filled), ratio * 100, f'{done:,}', f'{total:,}', eta_text, suffix)
 
 
 def write_progress(line, final=False, stream=None):
@@ -153,46 +207,92 @@ def SearchGroup(es, index_name, settings, field_filter, TotalExported = 0, Exclu
     print ("Removing time")
     search_q['sort'] = {"_shard_doc": "desc"}
     ForcePIT = True
-        
-  if True: #always use PIT
-    PITKeepAlive = '1m'
-    results = dict( es.open_point_in_time(index=index_name, keep_alive=PITKeepAlive))
-    #print ("open point in time : %s" % results)
-    search_q['pit'] = { 'id' : results['id'] }
 
-    SortOrder = { settings['timestamp'] : { "order": "asc", "format": "strict_date_optional_time_nanos" } }
+  export_file = settings['fullpath'] + '/' + field_filter + '.ndjson'
+  checkpoint_file = export_file + '.checkpoint'
+  resume = None
+  if settings.get('resume', True) and settings['TimeSeries'] != False:
+    resume = LoadCheckpoint(checkpoint_file)
+  if resume:
+    kept = TruncateLines(export_file, resume['lines'])
+    if kept < resume['lines']:
+      print ("Checkpoint says %s lines but %s only has %s, restarting that group"
+             % (f'{resume["lines"]:,}', export_file, f'{kept:,}'))
+      os.remove(checkpoint_file)
+      resume = None
+    else:
+      print ("Resuming %s at %s lines (%s)" % (field_filter, f'{kept:,}', resume['ts']))
+  if not resume:
+    for stale in (export_file, checkpoint_file):
+      if os.path.exists(stale):
+        os.remove(stale)   # no checkpoint, previous bytes are unusable
+
+  if True: #always use PIT
+    PITKeepAlive = settings.get('pit_keepalive', '5m')
+    results = dict( es.open_point_in_time(index=index_name, keep_alive=PITKeepAlive))
+    search_q['pit'] = { 'id' : results['id'] }
+    if settings['TimeSeries'] != False:
+      sort_clause = [ { settings['timestamp'] : { "order": "asc", "format": "strict_date_optional_time_nanos" } }, { "_shard_doc" : "asc" } ]
+    else:
+      sort_clause = [ { "_shard_doc" : "desc" } ]
     source_kwargs = source_search_kwargs(settings)
-    results = es.search( query=search_q['query'], pit=search_q['pit'], size=settings['page_size'], sort=SortOrder, request_timeout=settings['request_timeout'], rest_total_hits_as_int=True, **source_kwargs)
+    if resume:
+      # re-enter at the last completed timestamp, then drop the anchor docs already on disk.
+      # a fresh PIT means the old search_after cursor is worthless, so this is the only safe join.
+      search_q['query'] = json.loads(json.dumps(search_q['query']))
+      filters = search_q['query']['bool'].setdefault('filter', [])
+      filters.append({ "range" : { settings['timestamp'] : { "gte" : resume['ts'] } } })
+      if resume.get('ids'):
+        filters.append({ "bool" : { "must_not" : [ { "ids" : { "values" : resume['ids'] } } ] } })
+    results = es.search( query=search_q['query'], pit=search_q['pit'], size=settings['page_size'], sort=sort_clause, request_timeout=settings['request_timeout'], rest_total_hits_as_int=True, keep_alive=PITKeepAlive, **source_kwargs)
     expected = results['hits']['total']
 
-    print ("Total items to export : %s" % ( f'{expected:,}' ) )
-    
-
-    if expected == 0:
+    already = resume['lines'] if resume else 0
+    total = already + expected
+    print ("Total items to export : %s" % ( f'{total:,}' ) )
+    if expected == 0 and not resume:
       print ("No events returned from search")
-      return { "failed" : True, "message" : "search returned 0 results" }        
+      es.close_point_in_time(body= search_q['pit'] )
+      return { "failed" : True, "message" : "search returned 0 results" }
+    if expected == 0 and resume:
+      print ("Nothing left to export for %s" % field_filter)
+      es.close_point_in_time(body= search_q['pit'] )
+      return { "failed" : False, "message" : "completed" }
 
     CurrentExported = 0
+    on_disk = already          # lines actually written; may trail CurrentExported
     search_after = False
     first_page = results
     started = monotonic()
+    samples = deque([(0.0, 0)], maxlen=10)
+    msg_WriteResults = { "failed" : False, "message" : "completed" }
     while True:
       if first_page is not None:
         results = first_page
         first_page = None
       else:
-        results = es.search(query=search_q['query'], pit=search_q['pit'], size=settings['page_size'], sort=SortOrder, request_timeout=settings['request_timeout'], search_after=search_after, **source_kwargs )
+        results = es.search(query=search_q['query'], pit=search_q['pit'], size=settings['page_size'], sort=sort_clause, request_timeout=settings['request_timeout'], search_after=search_after, keep_alive=PITKeepAlive, **source_kwargs)
 
-      CurrentExported += len (results['hits']['hits'] )
-      write_progress(progress_line(CurrentExported, expected, monotonic() - started))
-
+      hits = results['hits']['hits']
+      if not hits:
+        break      # guard against a server that returns an empty tail page
+      CurrentExported += len (hits)
+      elapsed = monotonic() - started
+      samples.append((elapsed, CurrentExported))
+      write_progress(progress_line(already + CurrentExported, total, elapsed, samples=samples))
 
       msg_WriteResults = WriteResults(settings, field_filter, expected, results, IgnoreCount = True, ExcludeField = ExcludeField )
       if msg_WriteResults['failed']:
+        es.close_point_in_time(body= search_q['pit'] )
         return { "failed" : True, "message" : "Failed  writing file - (over 10k) export" }        
- 
-      if msg_WriteResults['sort']:
+
+      if msg_WriteResults.get('sort'):
         search_after = msg_WriteResults['sort']
+
+      #checkpoint only after the page is on disk
+      on_disk += msg_WriteResults.get('written', 0)
+      if settings.get('resume', True) and msg_WriteResults.get('ts'):
+        SaveCheckpoint(checkpoint_file, on_disk, msg_WriteResults['ts'], msg_WriteResults.get('ids', []))
 
       #break if got all results
       if CurrentExported >= expected:
@@ -200,12 +300,12 @@ def SearchGroup(es, index_name, settings, field_filter, TotalExported = 0, Exclu
       if settings['page_delay']:
         sleep(settings['page_delay'])
 
-    write_progress(progress_line(CurrentExported, expected, monotonic() - started), final=True)
+    write_progress(progress_line(on_disk, total, monotonic() - started, samples=samples), final=True)
     results = es.close_point_in_time(body= search_q['pit'] )
     if not results['succeeded']:
       print ("issue closing point in time search : %s" % results)
-    if msg_WriteResults['failed']:
-      print (msg_WriteResults)
+    if os.path.exists(checkpoint_file):
+      os.remove(checkpoint_file)
     return msg_WriteResults
 
 
@@ -300,8 +400,18 @@ def WriteResults(settings, field_filter, expected, results, IgnoreCount = False,
       total = results['hits']['total']
       total = total['value'] if isinstance(total, dict) else total
       if total == expected or IgnoreCount or ExcludeField:
+        page = results['hits']['hits']
+        # resume anchor: highest timestamp in this page plus every _id sharing it,
+        # so a restart can continue with range + ids must_not instead of a dead PIT sort
+        anchor_ts = None
+        anchor_ids = []
+        if page and isinstance(page[-1].get('sort'), list):
+          anchor_ts = page[-1]['sort'][0]
+          anchor_ids = [hit['_id'] for hit in page
+                        if isinstance(hit.get('sort'), list) and hit['sort'][0] == anchor_ts]
+
         ExportFile = open ( settings['fullpath'] + '/' + field_filter + '.ndjson', 'a', encoding='utf-8')
-        hits = results['hits']['hits']
+        hits = page
         if settings.get('output_filter_field'):
           hits = filter_hits(hits, settings['output_filter_field'], settings['output_filter_value'])
         for item in hits:
@@ -315,10 +425,11 @@ def WriteResults(settings, field_filter, expected, results, IgnoreCount = False,
           ExportFile.write('\n')
         ExportFile.close()
 
-        Message = { "failed" : False, "message" : "completed" } 
+        Message = { "failed" : False, "message" : "completed", "written" : len(hits),
+                    "ts" : anchor_ts, "ids" : anchor_ids }
         #Get sort value for last item
-        if 'sort' in results['hits']['hits'][-1].keys():
-          Message['sort'] = results['hits']['hits'][-1]['sort']
+        if page and isinstance(page[-1].get('sort'), list):
+          Message['sort'] = page[-1]['sort']
 
         return Message 
       else:
@@ -343,9 +454,11 @@ def ProcessGroup(es, index_name, settings, group, ExcludeField = False, AllItems
 
   if message['failed']:
     print (message)
-    if os.path.exists(source):
-      print ("Failed, removing file")
-      os.remove(source)  
+    # keep the partial ndjson + checkpoint so the next run continues instead of restarting
+    if os.path.exists(source) and os.path.getsize(source):
+      print ("Keeping partial file %s, rerun to resume" % source)
+    if message['message'] == "search returned 0 results" and os.path.exists(source):
+      os.remove(source)
   else:
     #This can happen when there are no items when exclude field
     if message['message'] == "search returned 0 results":
@@ -392,7 +505,7 @@ def ExportIndex(es, settings, TimeSeries, ExcludeField = False, AllItems = True,
       file_sha = settings['fullpath'] + '/' + group + '.checksums'
 
       if not os.path.exists( file_sha ):
-        if os.path.exists( file_ndjson ):
+        if os.path.exists( file_ndjson ) and not os.path.exists( file_ndjson + '.checkpoint' ):
           os.remove( file_ndjson )
         ProcessGroup(es, settings['index_name'], settings, group )
         if settings['export-csv']:
@@ -407,7 +520,7 @@ def ExportIndex(es, settings, TimeSeries, ExcludeField = False, AllItems = True,
   file_ndjson = settings['fullpath'] + '/' + group + '.ndjson'
   file_sha = settings['fullpath'] + '/' + group + '.checksums'
   if not os.path.exists( file_sha ):
-    if os.path.exists( file_ndjson ):
+    if os.path.exists( file_ndjson ) and not os.path.exists( file_ndjson + '.checkpoint' ):
       print ("Removing file %s and re-exporting results" % file_ndjson) 
       os.remove( file_ndjson )
     ProcessGroup(es, settings['index_name'], settings, group, ExcludeField = ExcludeField, AllItems = AllItems )

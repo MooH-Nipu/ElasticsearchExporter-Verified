@@ -9,7 +9,8 @@ Interactive Python CLI for exporting Elasticsearch indexes to NDJSON or CSV. It 
 - Command-line date, output-name, document-filter, and source-field selection
 - Optional Elasticsearch-side exact field filtering through `_field_caps`
 - PIT + `search_after` pagination with configurable page size, timeout, and delay
-- One-line progress bar with percentage, count, and ETA
+- Per-page checkpointing so an interrupted export resumes instead of restarting
+- One-line progress bar with percentage, count, throughput, and a windowed ETA
 - NDJSON or flattened CSV output
 - Exported timestamp conversion to a configured UTC offset
 - Per-file SHA-1 checksum metadata for NDJSON and final count verification
@@ -68,6 +69,8 @@ EXPORT_UTC_OFFSET=7
 PAGE_SIZE=2000
 REQUEST_TIMEOUT=120
 PAGE_DELAY=0.05
+RESUME=true
+PIT_KEEPALIVE=5m
 ```
 
 `.env` is ignored by Git. Never commit real credentials.
@@ -88,6 +91,8 @@ PAGE_DELAY=0.05
 | `PAGE_SIZE` | `2000` | Documents per request; accepted range `100`–`10000` |
 | `REQUEST_TIMEOUT` | `120` | Elasticsearch request timeout in seconds |
 | `PAGE_DELAY` | `0.05` | Delay between pages in seconds |
+| `RESUME` | `true` | Keep partial exports and continue from the last checkpoint |
+| `PIT_KEEPALIVE` | `5m` | Point-in-time lifetime; raise it if a page takes longer |
 | `TIMESTAMP_FIELD` | `@timestamp` | Field used for time range, sorting, and conversion |
 | `TIME_SERIES` | `true` | Set `false` for indexes without a time-series field |
 | `DEBUG` | `false` | Print loaded settings and query details |
@@ -221,6 +226,29 @@ exported/
 Existing `all.checksums` marks a completed run and causes that output directory to be skipped. Use a different `OUTPUT_NAME` for a distinct query or remove the old output directory deliberately before rerunning it.
 
 `BACKUP_FOLDER` is local file storage, not an Elasticsearch snapshot repository.
+
+## Resume a failed export
+
+An interrupted export keeps what it already wrote, so you never restart from zero.
+
+While a group is exporting, a `<group>.ndjson.checkpoint` file is written after every page. If the run dies, the file and the checkpoint stay on disk. Run the **same command** again and it continues:
+
+```text
+Exporting : Other for index aria-waf-*
+Resuming Other at 1,240,000 lines (2026-11-07T16:59:59.103Z)
+Total items to export : 1,300,000
+```
+
+A restart cannot reuse the old `search_after` cursor, because the point-in-time is gone. Instead the exporter re-enters at the last completed `@timestamp` and excludes the `_id`s already on disk, so each document is written exactly once.
+
+Notes:
+
+- The file is truncated back to the last checkpointed line first, so a half-written page is discarded rather than duplicated.
+- If the `.ndjson` is missing or shorter than the checkpoint claims, that group starts over instead of failing.
+- The checkpoint is deleted when the group finishes; `.checksums` and `all.checksums` still gate completed runs.
+- Set `RESUME=false` to discard partial output and start clean. That is also the only mode for `TIME_SERIES=false` indexes, which have no timestamp to resume from.
+- A failed group is no longer deleted, so `--export-csv` only runs on a finished group.
+- Documents indexed after the first attempt raise the count, so a resumed run can end in `MISMATCH`. Keep the same `--start`/`--end` window to avoid it.
 
 ## Optional interactive Elasticsearch-side field filter
 
