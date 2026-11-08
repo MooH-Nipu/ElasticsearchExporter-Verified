@@ -125,8 +125,11 @@ End date/time local UTC+7 (blank for no end): 2026-07-01 23:59:59
 Output file name (without extension, blank for hids-all): incident-july
 Query matched 1,234 documents
 Continue export? [y/N]: y
+Progress: [##############################] 100.0% | 1,234/1,234 | ETA 00:00 | 412/s
 VERIFIED: exported 1,234 of 1,234 matched documents
 ```
+
+If that run dies part-way, execute the same command again; see [Resume a failed export](#resume-a-failed-export).
 
 Both time values are required when either is supplied. Timezone-less input is treated as WIB (`UTC+7`) and converted to UTC. Explicit offsets and `Z` are respected.
 
@@ -221,6 +224,16 @@ exported/
         └── all.checksums
 ```
 
+While a run is in progress the folder also holds `incident-july.ndjson.checkpoint`; it is removed as soon as that group completes. After a crash the folder looks like this, and the next run continues from it:
+
+```text
+exported/
+└── aria-waf-all/
+    └── waf-sultra-policy/
+        ├── waf-sultra-policy.ndjson              # 1,240,000 lines, kept
+        └── waf-sultra-policy.ndjson.checkpoint   # resume anchor
+```
+
 `OUTPUT_FORMAT=csv` creates `incident-july.csv` and removes the temporary NDJSON after successful conversion. Nested objects become dotted CSV columns. Lists are stored as JSON text. Current checksum metadata describes the temporary NDJSON, not the resulting CSV.
 
 Existing `all.checksums` marks a completed run and causes that output directory to be skipped. Use a different `OUTPUT_NAME` for a distinct query or remove the old output directory deliberately before rerunning it.
@@ -234,10 +247,19 @@ An interrupted export keeps what it already wrote, so you never restart from zer
 While a group is exporting, a `<group>.ndjson.checkpoint` file is written after every page. If the run dies, the file and the checkpoint stay on disk. Run the **same command** again and it continues:
 
 ```text
-Exporting : Other for index aria-waf-*
-Resuming Other at 1,240,000 lines (2026-11-07T16:59:59.103Z)
+Exporting : waf-sultra-policy for index aria-waf-*
+Resuming waf-sultra-policy at 1,240,000 lines (2026-11-07T16:59:59.103Z)
 Total items to export : 1,300,000
 ```
+
+For example, this run dies at 1,240,000 of 1,300,000 documents:
+
+```bash
+python ElasticExporterCLI.py --index="aria-waf-*" --filter="waf.policy=Sultra-Policy" \
+  --start="2026-11-01 00:00:00" --end="2026-11-08 23:59:59" --output-name="waf-sultra-policy"
+```
+
+Run the exact same command again. It re-reads `waf-sultra-policy.ndjson.checkpoint`, keeps the 1,240,000 lines already on disk, and exports only the remaining 60,000.
 
 A restart cannot reuse the old `search_after` cursor, because the point-in-time is gone. Instead the exporter re-enters at the last completed `@timestamp` and excludes the `_id`s already on disk, so each document is written exactly once.
 
@@ -249,6 +271,7 @@ Notes:
 - Set `RESUME=false` to discard partial output and start clean. That is also the only mode for `TIME_SERIES=false` indexes, which have no timestamp to resume from.
 - A failed group is no longer deleted, so `--export-csv` only runs on a finished group.
 - Documents indexed after the first attempt raise the count, so a resumed run can end in `MISMATCH`. Keep the same `--start`/`--end` window to avoid it.
+- Delete `<group>.ndjson.checkpoint` by hand if you deliberately changed `--filter` or the time window under the same `--output-name`; the old anchor does not apply to a different query.
 
 ## Optional interactive Elasticsearch-side field filter
 
