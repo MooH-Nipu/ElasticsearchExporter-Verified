@@ -244,7 +244,7 @@ def SearchGroup(es, index_name, settings, field_filter, TotalExported = 0, Exclu
       filters.append({ "range" : { settings['timestamp'] : { "gte" : resume['ts'] } } })
       if resume.get('ids'):
         filters.append({ "bool" : { "must_not" : [ { "ids" : { "values" : resume['ids'] } } ] } })
-    results = es.search( query=search_q['query'], pit=search_q['pit'], size=settings['page_size'], sort=sort_clause, request_timeout=settings['request_timeout'], rest_total_hits_as_int=True, keep_alive=PITKeepAlive, **source_kwargs)
+    results = es.search( query=search_q['query'], pit=search_q['pit'], size=settings['page_size'], sort=sort_clause, request_timeout=settings['request_timeout'], rest_total_hits_as_int=True, **source_kwargs)
     expected = results['hits']['total']
 
     already = resume['lines'] if resume else 0
@@ -271,7 +271,7 @@ def SearchGroup(es, index_name, settings, field_filter, TotalExported = 0, Exclu
         results = first_page
         first_page = None
       else:
-        results = es.search(query=search_q['query'], pit=search_q['pit'], size=settings['page_size'], sort=sort_clause, request_timeout=settings['request_timeout'], search_after=search_after, keep_alive=PITKeepAlive, **source_kwargs)
+        results = es.search(query=search_q['query'], pit=search_q['pit'], size=settings['page_size'], sort=sort_clause, request_timeout=settings['request_timeout'], search_after=search_after, **source_kwargs)
 
       hits = results['hits']['hits']
       if not hits:
